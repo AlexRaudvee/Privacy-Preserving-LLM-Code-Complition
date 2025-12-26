@@ -207,3 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 .vscode/
+notebooks/._privacy_utility_tradeoff.ipynb
+src/._utils.py
+._.gitignore
