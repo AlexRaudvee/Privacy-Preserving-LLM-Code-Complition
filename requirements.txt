@@ -1,0 +1,11 @@
+datasets>=2.19.0
+transformers>=4.41.0
+torch>=2.1.0
+accelerate>=0.30.0
+rouge-score>=0.1.2
+rapidfuzz>=3.9.0
+matplotlib>=3.8.0
+pandas>=2.1.0
+tqdm>=4.66.0
+nbformat>=5.10.0
+jupyterlab>=4.0.0
