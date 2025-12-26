@@ -75,26 +75,26 @@ def _strip_comments_and_docstrings(code: str) -> str:
         return re.sub(r'^\s*(\"\"\".*?\"\"\"|\'\'\'.*?\'\'\')\s*', '', code_no_comments, flags=re.DOTALL)
 
 
-def _collect_defined_names(tree: ast.AST) -> Set[str]:
+def _collect_body_names(func: ast.FunctionDef) -> Set[str]:
+    """
+    Collect only names appearing in the function *body*,
+    excluding arguments, return types, decorators.
+    """
     names: Set[str] = set()
 
     class Visitor(ast.NodeVisitor):
         def visit_Name(self, node: ast.Name):
             names.add(node.id)
 
-        def visit_arg(self, node: ast.arg):
-            names.add(node.arg)
+        def visit_Attribute(self, node: ast.Attribute):
+            # Only recurse into value, never rename attr itself
+            self.visit(node.value)
 
-        def visit_FunctionDef(self, node: ast.FunctionDef):
-            names.add(node.name)
-            self.generic_visit(node)
+    for stmt in func.body:
+        Visitor().visit(stmt)
 
-        def visit_ClassDef(self, node: ast.ClassDef):
-            names.add(node.name)
-            self.generic_visit(node)
-
-    Visitor().visit(tree)
     return names
+
 
 
 def _make_name_mapping(used_names: Set[str], mode: str) -> Dict[str, str]:
@@ -132,61 +132,77 @@ class _Renamer(ast.NodeTransformer):
 
     def visit_Name(self, node: ast.Name):
         if node.id in self.mapping:
-            return ast.copy_location(ast.Name(id=self.mapping[node.id], ctx=node.ctx), node)
-        return node
-
-    def visit_arg(self, node: ast.arg):
-        if node.arg in self.mapping:
-            node.arg = self.mapping[node.arg]
+            return ast.copy_location(
+                ast.Name(id=self.mapping[node.id], ctx=node.ctx),
+                node,
+            )
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
-        # Do not rename the function name itself in this assignment (keep prompt anchored)
-        self.generic_visit(node)
+        # DO NOT touch:
+        # - name
+        # - args
+        # - returns
+        # - decorators
+        # Only transform the body
+        new_body = []
+        for stmt in node.body:
+            new_body.append(self.visit(stmt))
+        node.body = new_body
         return node
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        self.generic_visit(node)
+        new_body = []
+        for stmt in node.body:
+            new_body.append(self.visit(stmt))
+        node.body = new_body
         return node
 
     def visit_Attribute(self, node: ast.Attribute):
-        # Avoid renaming attribute names (e.g., obj.foo) because it can break code structure.
-        self.generic_visit(node)
+        node.value = self.visit(node.value)
         return node
+
 
 
 def low_obfuscation(prompt: str) -> str:
     """
-    "Low" obfuscation: variable renaming only (best-effort).
+    Rename only local variables inside function bodies.
+    Preserve API (function name, args, types, docstring).
     """
     try:
         tree = ast.parse(prompt)
-        used = _collect_defined_names(tree)
-        mapping = _make_name_mapping(used, mode="low")
-        tree2 = _Renamer(mapping).visit(tree)
-        ast.fix_missing_locations(tree2)
-        return ast.unparse(tree2)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                used = _collect_body_names(node)
+                mapping = _make_name_mapping(used, mode="low")
+                _Renamer(mapping).visit(node)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
     except Exception:
-        # If parsing fails, do a conservative regex rename of simple identifiers.
         return prompt
+
 
 
 def high_obfuscation(prompt: str) -> str:
     """
-    "High" obfuscation:
-      - strip comments and docstrings
-      - rename identifiers more aggressively
+    High obfuscation:
+      - strip comments
+      - strip docstrings
+      - rename only local variables
     """
     stripped = _strip_comments_and_docstrings(prompt)
     try:
         tree = ast.parse(stripped)
-        used = _collect_defined_names(tree)
-        mapping = _make_name_mapping(used, mode="high")
-        tree2 = _Renamer(mapping).visit(tree)
-        ast.fix_missing_locations(tree2)
-        return ast.unparse(tree2)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                used = _collect_body_names(node)
+                mapping = _make_name_mapping(used, mode="high")
+                _Renamer(mapping).visit(node)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
     except Exception:
         return stripped
+
 
 
 def privacy_score(prompt_variant: str, prompt_original: str) -> float:
