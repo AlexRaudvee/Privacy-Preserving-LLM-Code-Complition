@@ -212,3 +212,4 @@ src/._utils.py
 ._.gitignore
 ._.DS_Store
 .DS_Store
+._output.png

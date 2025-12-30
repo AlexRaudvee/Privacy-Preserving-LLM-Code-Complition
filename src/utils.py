@@ -12,74 +12,52 @@ import io
 import keyword
 import re
 import tokenize
-from dataclasses import dataclass
-from typing import Dict, Set, Tuple, Optional
+from typing import Dict, Set
 
 from rouge_score import rouge_scorer
 from rapidfuzz.distance import Levenshtein
 
 
+# -------------------------
+# Globals
+# -------------------------
+
 _PY_KEYWORDS: Set[str] = set(keyword.kwlist)
 _BUILTINS: Set[str] = set(dir(builtins))
 
 
-def _strip_comments_and_docstrings(code: str) -> str:
-    """
-    Removes:
-      - # comments
-      - standalone triple-quoted docstrings at module/function level (best-effort)
-    Keeps string literals elsewhere.
-    """
-    # 1) Strip comments using tokenize (robust vs regex)
+# -------------------------
+# Helpers
+# -------------------------
+
+def _strip_comments(code: str) -> str:
+    """Remove # comments, keep everything else."""
     out_tokens = []
     try:
         tokgen = tokenize.generate_tokens(io.StringIO(code).readline)
-        for tok_type, tok_str, start, end, line in tokgen:
-            if tok_type == tokenize.COMMENT:
-                continue
-            out_tokens.append((tok_type, tok_str))
-        code_no_comments = tokenize.untokenize(out_tokens)
+        for tok_type, tok_str, *_ in tokgen:
+            if tok_type != tokenize.COMMENT:
+                out_tokens.append((tok_type, tok_str))
+        return tokenize.untokenize(out_tokens)
     except Exception:
-        code_no_comments = re.sub(r"#.*", "", code)
+        return re.sub(r"#.*", "", code)
 
-    # 2) Remove docstrings using AST (best-effort). If parse fails, fall back to regex.
-    try:
-        tree = ast.parse(code_no_comments)
 
-        class DocstringRemover(ast.NodeTransformer):
-            def _remove_docstring(self, node):
-                if node.body and isinstance(node.body[0], ast.Expr):
-                    expr = node.body[0].value
-                    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-                        node.body = node.body[1:]
-                return node
-
-            def visit_Module(self, node: ast.Module):
-                node = self.generic_visit(node)
-                return self._remove_docstring(node)
-
-            def visit_FunctionDef(self, node: ast.FunctionDef):
-                node = self.generic_visit(node)
-                return self._remove_docstring(node)
-
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-                node = self.generic_visit(node)
-                return self._remove_docstring(node)
-
-        tree = DocstringRemover().visit(tree)
-        ast.fix_missing_locations(tree)
-        # ast.unparse exists in 3.9+, but we can still rely on it for most environments.
-        return ast.unparse(tree)
-    except Exception:
-        # Simple regex removal of leading docstring after "def ..."
-        return re.sub(r'^\s*(\"\"\".*?\"\"\"|\'\'\'.*?\'\'\')\s*', '', code_no_comments, flags=re.DOTALL)
+def _normalize_docstring(ds: str) -> str:
+    """
+    Keep only the first sentence of a docstring.
+    Removes examples, lists, and extra detail.
+    """
+    ds = ds.strip()
+    # Cut at first example or doctest
+    ds = ds.split(">>>")[0]
+    # Take first sentence
+    match = re.split(r"\.\s+", ds, maxsplit=1)
+    return match[0].strip() + "." if match else ds
 
 
 def _collect_body_names(func: ast.FunctionDef) -> Set[str]:
-    """
-    Collect only names appearing in the function *body*,
-    excluding arguments, return types, decorators.
-    """
+    """Collect identifiers used inside function body only."""
     names: Set[str] = set()
 
     class Visitor(ast.NodeVisitor):
@@ -87,7 +65,6 @@ def _collect_body_names(func: ast.FunctionDef) -> Set[str]:
             names.add(node.id)
 
         def visit_Attribute(self, node: ast.Attribute):
-            # Only recurse into value, never rename attr itself
             self.visit(node.value)
 
     for stmt in func.body:
@@ -96,35 +73,33 @@ def _collect_body_names(func: ast.FunctionDef) -> Set[str]:
     return names
 
 
-
 def _make_name_mapping(used_names: Set[str], mode: str) -> Dict[str, str]:
-    """
-    mode:
-      - "low": keep some readability (v1, v2, ...)
-      - "high": placeholders (VAR_0, VAR_1, ...)
-    """
     mapping: Dict[str, str] = {}
     i = 0
+
     for name in sorted(used_names):
         if (
             name in _PY_KEYWORDS
             or name in _BUILTINS
             or name.startswith("__")
+            or name in {"self", "cls"}
         ):
             continue
-        # Avoid renaming very common semantic names you might want to preserve (tune as desired)
-        if mode == "low" and name in {"self", "cls"}:
-            continue
 
-        new_name = (f"v{i}" if mode == "low" else f"VAR_{i}")
-        # ensure we don't collide with existing names
-        while new_name in used_names or new_name in _PY_KEYWORDS or new_name in _BUILTINS:
+        new_name = f"v{i}" if mode == "low" else f"VAR_{i}"
+        while new_name in used_names:
             i += 1
-            new_name = (f"v{i}" if mode == "low" else f"VAR_{i}")
+            new_name = f"v{i}" if mode == "low" else f"VAR_{i}"
+
         mapping[name] = new_name
         i += 1
+
     return mapping
 
+
+# -------------------------
+# AST transformers
+# -------------------------
 
 class _Renamer(ast.NodeTransformer):
     def __init__(self, mapping: Dict[str, str]):
@@ -133,48 +108,62 @@ class _Renamer(ast.NodeTransformer):
     def visit_Name(self, node: ast.Name):
         if node.id in self.mapping:
             return ast.copy_location(
-                ast.Name(id=self.mapping[node.id], ctx=node.ctx),
-                node,
+                ast.Name(id=self.mapping[node.id], ctx=node.ctx), node
             )
-        return node
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        # DO NOT touch:
-        # - name
-        # - args
-        # - returns
-        # - decorators
-        # Only transform the body
-        new_body = []
-        for stmt in node.body:
-            new_body.append(self.visit(stmt))
-        node.body = new_body
-        return node
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
-        new_body = []
-        for stmt in node.body:
-            new_body.append(self.visit(stmt))
-        node.body = new_body
         return node
 
     def visit_Attribute(self, node: ast.Attribute):
         node.value = self.visit(node.value)
         return node
 
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        # Preserve API: name, args, returns, decorators
+        node.body = [self.visit(stmt) for stmt in node.body]
+        return node
 
+
+class _LiteralMasker(ast.NodeTransformer):
+    """Mask string and numeric literals."""
+
+    def visit_Constant(self, node: ast.Constant):
+        if isinstance(node.value, str):
+            return ast.copy_location(ast.Constant(value="STR"), node)
+        if isinstance(node.value, (int, float)):
+            return ast.copy_location(ast.Constant(value=0), node)
+        return node
+
+
+class _DocstringNormalizer(ast.NodeTransformer):
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            node.body[0].value.value = _normalize_docstring(
+                node.body[0].value.value
+            )
+        return node
+
+
+# -------------------------
+# Public API
+# -------------------------
 
 def low_obfuscation(prompt: str) -> str:
     """
-    Rename only local variables inside function bodies.
-    Preserve API (function name, args, types, docstring).
+    Low obfuscation:
+    - rename local variables only
+    - preserve signature, types, docstring
+    - normalize formatting via AST
     """
     try:
         tree = ast.parse(prompt)
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
-                used = _collect_body_names(node)
-                mapping = _make_name_mapping(used, mode="low")
+                names = _collect_body_names(node)
+                mapping = _make_name_mapping(names, mode="low")
                 _Renamer(mapping).visit(node)
         ast.fix_missing_locations(tree)
         return ast.unparse(tree)
@@ -182,35 +171,38 @@ def low_obfuscation(prompt: str) -> str:
         return prompt
 
 
-
 def high_obfuscation(prompt: str) -> str:
     """
     High obfuscation:
-      - strip comments
-      - strip docstrings
-      - rename only local variables
+    - strip # comments
+    - normalize docstring
+    - rename locals aggressively
+    - mask string & numeric literals
     """
-    stripped = _strip_comments_and_docstrings(prompt)
     try:
+        stripped = _strip_comments(prompt)
         tree = ast.parse(stripped)
+
+        _DocstringNormalizer().visit(tree)
+        _LiteralMasker().visit(tree)
+
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
-                used = _collect_body_names(node)
-                mapping = _make_name_mapping(used, mode="high")
+                names = _collect_body_names(node)
+                mapping = _make_name_mapping(names, mode="high")
                 _Renamer(mapping).visit(node)
+
         ast.fix_missing_locations(tree)
         return ast.unparse(tree)
     except Exception:
-        return stripped
+        return prompt
 
 
+# -------------------------
+# Metrics
+# -------------------------
 
 def privacy_score(prompt_variant: str, prompt_original: str) -> float:
-    """
-    Normalized Levenshtein distance in [0,1]:
-      0 = identical to original prompt (low privacy)
-      1 = maximally different (high privacy, by this proxy)
-    """
     if not prompt_original:
         return 0.0
     dist = Levenshtein.distance(prompt_variant, prompt_original)
@@ -220,8 +212,5 @@ def privacy_score(prompt_variant: str, prompt_original: str) -> float:
 _scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=False)
 
 def utility_score_rougeL(completion: str, canonical_solution: str) -> float:
-    """
-    ROUGE-L F1 between completion and canonical solution in [0,1].
-    """
     scores = _scorer.score(canonical_solution, completion)
     return float(scores["rougeL"].fmeasure)
